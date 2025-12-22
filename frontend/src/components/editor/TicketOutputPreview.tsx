@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useRef, useState, useLayoutEffect } from 'react';
 import { X, Printer, ChevronLeft, ChevronRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -282,13 +282,33 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
   const printContainerRef = useRef<HTMLDivElement>(null);
   const { user, token } = useAuth();
 
-  const getPxPerMm = () => {
+  const [pxPerMm, setPxPerMm] = useState(0);
+
+  useLayoutEffect(() => {
     const el = printContainerRef.current;
-    if (!el) return 0;
-    const wPx = el.getBoundingClientRect().width;
-    const mm = A4_WIDTH_MM;
-    if (!wPx || !mm) return 0;
-    return wPx / mm;
+    if (!el) return;
+
+    const update = () => {
+      const wPx = el.getBoundingClientRect().width;
+      const mm = A4_WIDTH_MM;
+      const next = wPx && mm ? wPx / mm : 0;
+      setPxPerMm(Number.isFinite(next) ? next : 0);
+    };
+
+    update();
+
+    const ro = new ResizeObserver(() => update());
+    ro.observe(el);
+
+    window.addEventListener('resize', update);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', update);
+    };
+  }, []);
+
+  const getPxPerMm = () => {
+    return pxPerMm;
   };
 
   const [assignEmail, setAssignEmail] = useState('');
@@ -377,6 +397,12 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
         throw new Error('Cannot measure pxPerMm (page preview not mounted)');
       }
 
+      /**
+       * TEXT SIZE RULE (LOCKED):
+       * - fontSize is always stored in millimeters.
+       * - px values from UI must be converted to mm before saving/sending.
+       * - Backend assumes fontSizeMm is physically correct.
+       */
       const ptToMm = (pt: number) => (Number(pt) || 0) * (25.4 / 72);
       const pxToMm = (px: number) => (Number(px) || 0) / pxPerMm;
 
@@ -778,10 +804,9 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
                 height: `${A4_HEIGHT_MM}mm`,
               }}
             >
-              {currentPageData && (
+              {currentPageData && pxPerMm > 0 && (
                 <div className="absolute inset-0">
                   {(() => {
-                    const pxPerMm = getPxPerMm() || 1;
                     const ptToMm = (pt: number) => (Number(pt) || 0) * (25.4 / 72);
                     const pxToMm = (px: number) => (Number(px) || 0) / pxPerMm;
 

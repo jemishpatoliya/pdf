@@ -1,3 +1,3 @@
 module.exports = {
-  BACKEND_BASE_URL: "https://pdfworkers-production.up.railway.app",
+  BACKEND_BASE_URL: "https://backend-production-1075.up.railway.app",
 };

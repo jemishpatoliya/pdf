@@ -122,7 +122,7 @@ function getBackendBaseUrl() {
   const trimmed = typeof raw === 'string' ? raw.trim() : '';
   if (trimmed) return trimmed;
 
-  return 'https://pdf1-backend.onrender.com';
+  return 'https://backend-production-1075.up.railway.app';
 }
 
 // Offline cache utilities
