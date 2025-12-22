@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "postinstall": "cd backend && npm install --omit=dev",
+    "build": "cd frontend && npm install && npm run build",
     "start": "node backend/src/bootstrap.js"
   }
 }

@@ -1,0 +1,8 @@
+[build]
+  builder = "nixpacks"
+  buildCommand = "npm run build"
+  installCommand = "npm install"
+  startCommand = "npm start"
+
+[deploy]
+  startCommand = "node backend/src/bootstrap.js"
