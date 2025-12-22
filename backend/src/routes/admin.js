@@ -190,6 +190,33 @@ router.post('/assign-job', authMiddleware, requireAdmin, async (req, res) => {
           };
         }
 
+        if (item.type === 'rect') {
+          const widthMm = Number(item.widthMm);
+          const heightMm = Number(item.heightMm);
+          const strokeWidthMm = Number(item.strokeWidthMm);
+          if (!Number.isFinite(widthMm) || widthMm <= 0 || !Number.isFinite(heightMm) || heightMm <= 0) {
+            const err = new Error('Rect item must include widthMm and heightMm');
+            err.statusCode = 400;
+            throw err;
+          }
+          if (!Number.isFinite(strokeWidthMm) || strokeWidthMm < 0) {
+            const err = new Error('Rect item must include a non-negative strokeWidthMm');
+            err.statusCode = 400;
+            throw err;
+          }
+
+          return {
+            type: 'rect',
+            xMm: Number(item.xMm),
+            yMm: Number(item.yMm),
+            widthMm,
+            heightMm,
+            strokeWidthMm,
+            strokeColor: typeof item.strokeColor === 'string' ? item.strokeColor : undefined,
+            fillColor: item.fillColor === null ? null : (typeof item.fillColor === 'string' ? item.fillColor : undefined),
+          };
+        }
+
         return item;
       });
 
@@ -231,7 +258,9 @@ router.post('/assign-job', authMiddleware, requireAdmin, async (req, res) => {
     const baseJobId = jobDoc._id.toString();
 
     if (!redisEnabled) {
-      throw new Error('Redis is disabled but render jobs require Redis');
+      const err = new Error('Redis is disabled but render jobs require Redis');
+      err.statusCode = 503;
+      throw err;
     }
 
     for (let pageIndex = 0; pageIndex < totalPages; pageIndex += 1) {
@@ -274,6 +303,11 @@ router.post('/assign-job', authMiddleware, requireAdmin, async (req, res) => {
           `❌ Failed to enqueue page ${pageIndex + 1}/${totalPages} for job ${jobDoc._id}`,
           err
         );
+
+        if (err && typeof err.statusCode !== 'number') {
+          err.statusCode = 503;
+          err.message = 'Failed to enqueue background render job (queue unavailable)';
+        }
         throw err;
       }
     }
@@ -298,7 +332,17 @@ router.post('/assign-job', authMiddleware, requireAdmin, async (req, res) => {
       });
     }
 
-    return res.status(500).json({ message: 'Internal server error' });
+    if (status !== 500) {
+      return res.status(status).json({
+        success: false,
+        message: err && typeof err.message === 'string' ? err.message : 'Request failed',
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: err && typeof err.message === 'string' && err.message ? err.message : 'Internal server error',
+    });
   }
 });
 

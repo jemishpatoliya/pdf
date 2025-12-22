@@ -19,6 +19,14 @@ import type { TicketOutputPage, TicketOnPage } from './TicketEditor';
  * - No container-based resizing is allowed.
  */
 
+/**
+ * BORDER / LINE RULE (LOCKED):
+ * - CSS borders are editor-only.
+ * - Any line that must appear in PDF/print
+ *   MUST be represented as a `rect` layout item.
+ * - pdf-lib renders only MmLayout items.
+ */
+
 interface TicketOutputPreviewProps {
   pages: TicketOutputPage[];
   onClose: () => void;
@@ -62,6 +70,7 @@ type VectorPageItem =
       letterSpacingAfterX?: number[];
       fontFamily?: string;
       color?: string;
+      rotationDeg?: number;
     };
 
 interface VectorLayoutPage {
@@ -201,6 +210,33 @@ function computeTicketFittedRectPercent(page: TicketOutputPage) {
   );
 }
 
+function computeTicketImageRectMm(opts: {
+  pageWidthMm: number;
+  ticketHeightMm: number;
+  baseYmm: number;
+  ticketImageXPercent: number;
+  ticketImageYPercent: number;
+  ticketImageWidthPercent: number;
+  aspectRatio: number;
+}) {
+  const xPercent = Number(opts.ticketImageXPercent);
+  const yPercent = Number(opts.ticketImageYPercent);
+  const wPercent = Number(opts.ticketImageWidthPercent);
+  const ar = Number(opts.aspectRatio);
+
+  const safeXPercent = Number.isFinite(xPercent) ? xPercent : 0;
+  const safeYPercent = Number.isFinite(yPercent) ? yPercent : 0;
+  const safeWPercent = Number.isFinite(wPercent) ? wPercent : 0;
+  const safeAr = Number.isFinite(ar) && ar > 0 ? ar : 1;
+
+  const xMm = (safeXPercent / 100) * opts.pageWidthMm;
+  const yMm = opts.baseYmm + (safeYPercent / 100) * opts.ticketHeightMm;
+  const widthMm = (safeWPercent / 100) * opts.pageWidthMm;
+  const heightMm = widthMm / safeAr;
+
+  return { xMm, yMm, widthMm, heightMm };
+}
+
 // Helper to build a vector-only layout description from the current TicketOutputPage[]
 // NOTE: The backend still treats these as experimental until the worker/svg path is
 // implemented. For now this only runs when USE_VECTOR_LAYOUT is true.
@@ -266,6 +302,7 @@ function buildVectorLayoutPages(
           letterSpacingAfterX: seriesForSlot.letterStyles?.map((ls) => ls.spacingAfterX ?? 0),
           fontFamily: slot.fontFamily,
           color: slot.color,
+          rotationDeg: Number(slot.rotation) || 0,
         });
       });
     });
@@ -438,15 +475,30 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
               color?: string;
               rotationDeg?: number;
             }
+          | {
+              type: 'rect';
+              xMm: number;
+              yMm: number;
+              widthMm: number;
+              heightMm: number;
+              strokeWidthMm: number;
+              strokeColor?: string;
+              fillColor?: string | null;
+            }
         > = [];
 
         page.tickets.forEach((ticket, idx) => {
           const baseYmm = ticketHeightMm * idx;
 
-          const imgXmm = (page.ticketImageXPercent / 100) * pageWidthMm;
-          const imgYmm = baseYmm + (page.ticketImageYPercent / 100) * ticketHeightMm;
-          const imgWmm = (page.ticketImageWidthPercent / 100) * pageWidthMm;
-          const imgHmm = imgWmm / aspectRatio;
+          const { xMm: imgXmm, yMm: imgYmm, widthMm: imgWmm, heightMm: imgHmm } = computeTicketImageRectMm({
+            pageWidthMm,
+            ticketHeightMm,
+            baseYmm,
+            ticketImageXPercent: Number(page.ticketImageXPercent),
+            ticketImageYPercent: Number(page.ticketImageYPercent),
+            ticketImageWidthPercent: Number(page.ticketImageWidthPercent),
+            aspectRatio,
+          });
 
           // Ticket image area
           items.push({
@@ -456,6 +508,19 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
             yMm: imgYmm,
             widthMm: imgWmm,
             aspectRatio,
+          });
+
+          // Printable border/line around the final ticket/image area (mm-only).
+          // Keep CSS borders editor-only.
+          items.push({
+            type: 'rect',
+            xMm: imgXmm,
+            yMm: imgYmm,
+            widthMm: imgWmm,
+            heightMm: imgHmm,
+            strokeWidthMm: 0.25,
+            strokeColor: '#000000',
+            fillColor: null,
           });
 
           // Series number text for each configured slot on this ticket
@@ -540,6 +605,124 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
     } finally {
       setAssignLoading(false);
     }
+  };
+
+  const handlePrint = () => {
+    (async () => {
+      try {
+        if (!token) {
+          safeToast('Missing auth token');
+          return;
+        }
+        const pxPerMmNow = getPxPerMm();
+        if (!Number.isFinite(pxPerMmNow) || pxPerMmNow <= 0) {
+          safeToast('Cannot measure pxPerMm (page preview not mounted)');
+          return;
+        }
+
+        const ptToMm = (pt: number) => (Number(pt) || 0) * (25.4 / 72);
+        const pxToMm = (px: number) => (Number(px) || 0) / pxPerMmNow;
+
+        const pageWidthMm = A4_WIDTH_MM;
+        const pageHeightMm = A4_HEIGHT_MM;
+        const ticketHeightMm = pageHeightMm / 4;
+
+        const layoutPages = pages.map((page) => {
+          const aspectRatio =
+            page.ticketImageSize?.width && page.ticketImageSize?.height
+              ? page.ticketImageSize.width / page.ticketImageSize.height
+              : 1;
+
+          const items: any[] = [];
+
+          page.tickets.forEach((ticket, idx) => {
+            const baseYmm = ticketHeightMm * idx;
+            const { xMm: imgXmm, yMm: imgYmm, widthMm: imgWmm, heightMm: imgHmm } = computeTicketImageRectMm({
+              pageWidthMm,
+              ticketHeightMm,
+              baseYmm,
+              ticketImageXPercent: Number(page.ticketImageXPercent),
+              ticketImageYPercent: Number(page.ticketImageYPercent),
+              ticketImageWidthPercent: Number(page.ticketImageWidthPercent),
+              aspectRatio,
+            });
+
+            items.push({
+              type: 'image',
+              src: page.ticketImageData,
+              xMm: imgXmm,
+              yMm: imgYmm,
+              widthMm: imgWmm,
+              aspectRatio,
+            });
+
+            items.push({
+              type: 'rect',
+              xMm: imgXmm,
+              yMm: imgYmm,
+              widthMm: imgWmm,
+              heightMm: imgHmm,
+              strokeWidthMm: 0.25,
+              strokeColor: '#000000',
+              fillColor: null,
+            });
+
+            page.seriesSlots.forEach((slot) => {
+              const seriesForSlot = ticket.seriesBySlot[slot.id];
+              if (!seriesForSlot) return;
+
+              const slotXmm = imgXmm + (Number(slot.x) / 100) * imgWmm;
+              const slotYmm = imgYmm + (Number(slot.y) / 100) * imgHmm;
+
+              const fontSizeMm = pxToMm(
+                Number(seriesForSlot.letterStyles?.[0]?.fontSize) || Number(slot.defaultFontSize) || 0
+              );
+
+              items.push({
+                type: 'text',
+                text: seriesForSlot.seriesValue,
+                xMm: slotXmm,
+                yMm: slotYmm,
+                fontSizeMm,
+                letterFontSizesMm: seriesForSlot.letterStyles?.map((ls) => pxToMm(Number(ls.fontSize) || 0)),
+                offsetYmm: seriesForSlot.letterStyles?.map((ls) => pxToMm(Number(ls.offsetY) || 0)),
+                letterSpacingMm: seriesForSlot.letterStyles?.map((ls) => ptToMm(Number(ls.spacingAfterX) || 0)),
+                fontFamily: slot.fontFamily,
+                color: slot.color,
+                rotationDeg: Number(slot.rotation) || 0,
+              });
+            });
+          });
+
+          return {
+            page: { widthMm: pageWidthMm, heightMm: pageHeightMm },
+            items,
+          };
+        });
+
+        const res = await fetch(`${BACKEND_URL}/api/generate-output-pdf-buffer`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ pages: layoutPages }),
+        });
+
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.message || 'Failed to generate PDF');
+        }
+
+        const buf = await res.arrayBuffer();
+        const blob = new Blob([buf], { type: 'application/pdf' });
+        const url = URL.createObjectURL(blob);
+        window.open(url, '_blank');
+      } catch (err) {
+        console.error('Print PDF error:', err);
+        safeToast(err instanceof Error ? err.message : 'Failed to print');
+      }
+    })();
   };
 
   const renderTicketHtml = (
@@ -627,115 +810,6 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
     `;
   };
 
-  const handlePrint = () => {
-    const printWindow = window.open('', '_blank');
-    if (!printWindow) {
-      alert('Please allow popups to print.');
-    }
-
-    const ticketHeight = A4_HEIGHT_MM / 4;
-
-    const fontFaceCss = (customFonts || [])
-      .map(
-        (font) => `@font-face {
-  font-family: "${font.family}";
-  src: url(${font.dataUrl});
-  font-weight: normal;
-  font-style: normal;
-}`
-      )
-      .join('\n');
-
-    const pagesHtml = pages.map((page) => {
-      const ticketsHtml = page.tickets.map((ticket) =>
-        renderTicketHtml(page, ticket, ticketHeight)
-      ).join('');
-
-      return `
-        <div class="page">
-          ${ticketsHtml}
-        </div>
-      `;
-    }).join('');
-
-    printWindow.document.write(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <title>Ticket Output</title>
-          <style>
-            ${fontFaceCss}
-            @page {
-              size: A4;
-              margin: 0;
-            }
-            * {
-              box-sizing: border-box;
-              margin: 0;
-              padding: 0;
-            }
-            body {
-              font-family: Arial, sans-serif;
-            }
-            .page {
-              width: ${A4_WIDTH_MM}mm;
-              height: ${A4_HEIGHT_MM}mm;
-              page-break-after: always;
-              display: flex;
-              flex-direction: column;
-              background: white;
-            }
-            .page:last-child {
-              page-break-after: avoid;
-            }
-            .ticket {
-              flex: 1;
-              position: relative;
-              overflow: hidden;
-              border-bottom: 1px dashed #ccc;
-            }
-            .ticket:last-child {
-              border-bottom: none;
-            }
-            .ticket-inner {
-              position: absolute;
-              inset: 0;
-              overflow: hidden;
-            }
-            .ticket-image {
-              position: absolute;
-            }
-            .series-slot {
-              position: absolute;
-              display: flex;
-              align-items: center;
-              overflow: visible;
-              transform-origin: center center;
-            }
-            .series-letters {
-              display: flex;
-              align-items: baseline;
-              white-space: pre;
-            }
-            @media print {
-              body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-              .ticket { border-bottom: none; }
-            }
-          </style>
-        </head>
-        <body>
-          ${pagesHtml}
-        </body>
-      </html>
-    `);
-
-    printWindow.document.close();
-    printWindow.focus();
-    setTimeout(() => {
-      printWindow.print();
-    }, 500);
-  };
-
   const currentPageData = pages[currentPage];
 
   return (
@@ -754,7 +828,7 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
         </div>
         <Button onClick={handlePrint} size="sm" className="gap-2">
           <Printer className="h-4 w-4" />
-          Print All Pages
+          Generate PDF
         </Button>
       </div>
 
@@ -821,10 +895,15 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
                     return currentPageData.tickets.map((ticket, idx) => {
                       const baseYmm = ticketHeightMm * idx;
 
-                      const imgXmm = (currentPageData.ticketImageXPercent / 100) * pageWidthMm;
-                      const imgYmm = baseYmm + (currentPageData.ticketImageYPercent / 100) * ticketHeightMm;
-                      const imgWmm = (currentPageData.ticketImageWidthPercent / 100) * pageWidthMm;
-                      const imgHmm = imgWmm / aspectRatio;
+                      const { xMm: imgXmm, yMm: imgYmm, widthMm: imgWmm, heightMm: imgHmm } = computeTicketImageRectMm({
+                        pageWidthMm,
+                        ticketHeightMm,
+                        baseYmm,
+                        ticketImageXPercent: Number(currentPageData.ticketImageXPercent),
+                        ticketImageYPercent: Number(currentPageData.ticketImageYPercent),
+                        ticketImageWidthPercent: Number(currentPageData.ticketImageWidthPercent),
+                        aspectRatio,
+                      });
 
                       return (
                         <React.Fragment key={idx}>
@@ -837,6 +916,22 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
                               top: `${imgYmm}mm`,
                               width: `${imgWmm}mm`,
                               height: 'auto',
+                              zIndex: 1,
+                            }}
+                          />
+
+                          <div
+                            style={{
+                              position: 'absolute',
+                              left: `${imgXmm}mm`,
+                              top: `${imgYmm}mm`,
+                              width: `${imgWmm}mm`,
+                              height: `${imgHmm}mm`,
+                              border: `0.25mm solid #000000`,
+                              boxSizing: 'border-box',
+                              pointerEvents: 'none',
+                              background: 'transparent',
+                              zIndex: 2,
                             }}
                           />
 
@@ -844,6 +939,7 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
                             .sort((a, b) => (a.y - b.y) || (a.x - b.x))
                             .map((slot) => {
                               const seriesForSlot = ticket.seriesBySlot[slot.id];
+
                               const seriesText = seriesForSlot?.seriesValue ?? '';
                               if (!seriesText) return null;
 

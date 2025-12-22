@@ -149,6 +149,39 @@ router.post('/generate-output-pdf', authMiddleware, async (req, res) => {
   }
 });
 
+// POST /api/generate-output-pdf-buffer
+// Returns the generated PDF bytes directly (no S3 upload).
+// Use this for WYSIWYG printing from the frontend because it prints the exact pdf-lib output.
+router.post('/generate-output-pdf-buffer', authMiddleware, async (req, res) => {
+  try {
+    const { pages } = req.body || {};
+
+    if (!Array.isArray(pages) || pages.length === 0) {
+      return res.status(400).json({ message: 'pages array is required' });
+    }
+
+    for (const p of pages) {
+      const w = Number(p?.page?.widthMm);
+      const h = Number(p?.page?.heightMm);
+      if (!Number.isFinite(w) || w <= 0 || !Number.isFinite(h) || h <= 0) {
+        return res.status(400).json({ message: 'Each page must include page.widthMm and page.heightMm' });
+      }
+      if (!Array.isArray(p?.items)) {
+        return res.status(400).json({ message: 'Each page must include an items array' });
+      }
+    }
+
+    const pdfBuffer = await generateOutputPdfBuffer(pages);
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="output.pdf"');
+    return res.send(pdfBuffer);
+  } catch (err) {
+    console.error('generate-output-pdf-buffer error', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 router.post('/series/generate', async (req, res) => {
   try {
     const { templateBase64, templateType, startNumber, endNumber } = req.body || {};

@@ -5,6 +5,7 @@ import {
   popGraphicsState,
   translate,
   rotateRadians,
+  rgb,
 } from 'pdf-lib';
 
 const PT_PER_MM = 72 / 25.4;
@@ -13,6 +14,16 @@ function mmToPt(mm) {
   const n = Number(mm);
   if (!Number.isFinite(n)) return 0;
   return n * PT_PER_MM;
+}
+
+function rgbFromHex(hex) {
+  const h = String(hex || '').trim().replace('#', '');
+  if (h.length !== 6) return rgb(0, 0, 0);
+  const r = Number.parseInt(h.slice(0, 2), 16);
+  const g = Number.parseInt(h.slice(2, 4), 16);
+  const b = Number.parseInt(h.slice(4, 6), 16);
+  if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) return rgb(0, 0, 0);
+  return rgb(r / 255, g / 255, b / 255);
 }
 
 function parseDataUrl(dataUrl) {
@@ -199,6 +210,30 @@ async function renderMmPage(pdfDoc, pageLayout) {
         drawLetters();
         page.pushOperators(popGraphicsState());
       }
+      continue;
+    }
+
+    if (item.type === 'rect') {
+      const xPt = mmToPt(item.xMm);
+      const wPt = mmToPt(item.widthMm);
+      const hPt = mmToPt(item.heightMm);
+      const yBottomPt = pageHeightPt - mmToPt(item.yMm) - hPt;
+      const borderWidthPt = mmToPt(item.strokeWidthMm);
+
+      if (wPt <= 0 || hPt <= 0) continue;
+
+      const strokeColor = item.strokeColor ? rgbFromHex(item.strokeColor) : rgb(0, 0, 0);
+      const fillColor = item.fillColor ? rgbFromHex(item.fillColor) : undefined;
+
+      page.drawRectangle({
+        x: xPt,
+        y: yBottomPt,
+        width: wPt,
+        height: hPt,
+        borderWidth: borderWidthPt,
+        borderColor: strokeColor,
+        color: fillColor,
+      });
       continue;
     }
   }
