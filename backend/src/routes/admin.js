@@ -109,36 +109,94 @@ router.post('/assign-job', authMiddleware, requireAdmin, async (req, res) => {
       return res.status(400).json({ message: 'assignedQuota must be a positive number' });
     }
 
-    // Safety: ensure layoutPages only contain lightweight S3 references, no base64 blobs
+    // Validate + sanitize mm-only layouts.
+    // Notes:
+    // - No page-size assumptions (admin-owned size).
+    // - No margins/fit logic.
+    // - Keep image src lightweight (typically s3://...), not large base64 blobs.
     const sanitizedLayoutPages = layoutPages.map((page) => {
       const layoutMode =
         page && typeof page.layoutMode === 'string' ? page.layoutMode : 'raster';
 
+      const widthMm = Number(page?.page?.widthMm);
+      const heightMm = Number(page?.page?.heightMm);
+      if (!Number.isFinite(widthMm) || widthMm <= 0 || !Number.isFinite(heightMm) || heightMm <= 0) {
+        const err = new Error('Invalid page size: page.widthMm and page.heightMm are required');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const items = Array.isArray(page?.items) ? page.items : [];
+      const sanitizedItems = items.map((item) => {
+        if (!item || typeof item !== 'object') return item;
+
+        if (item.type === 'image') {
+          const src = typeof item.src === 'string' ? item.src : '';
+          // Keep it lightweight; prefer s3://. (We still allow data: URLs for other entry points.)
+          if (src.startsWith('data:')) {
+            const err = new Error('Image src must be a lightweight reference (s3://...), not a data URL');
+            err.statusCode = 400;
+            throw err;
+          }
+
+          const widthMmRaw = Number(item.widthMm);
+          const heightMmRaw = Number(item.heightMm);
+          const widthMm = Number.isFinite(widthMmRaw) && widthMmRaw > 0 ? widthMmRaw : undefined;
+          const heightMm = Number.isFinite(heightMmRaw) && heightMmRaw > 0 ? heightMmRaw : undefined;
+
+          const aspectRatioRaw = Number(item.aspectRatio);
+          const aspectRatio =
+            Number.isFinite(aspectRatioRaw) && aspectRatioRaw > 0 ? aspectRatioRaw : undefined;
+
+          if (!widthMm && !heightMm) {
+            const err = new Error('Image item must include widthMm or heightMm');
+            err.statusCode = 400;
+            throw err;
+          }
+
+          if ((widthMm && !heightMm) || (!widthMm && heightMm)) {
+            if (!aspectRatio) {
+              const err = new Error('Image item missing aspectRatio (required when only one dimension is provided)');
+              err.statusCode = 400;
+              throw err;
+            }
+          }
+
+          return {
+            type: 'image',
+            src,
+            xMm: Number(item.xMm),
+            yMm: Number(item.yMm),
+            widthMm,
+            heightMm,
+            aspectRatio,
+            rotationDeg: item.rotationDeg === undefined ? undefined : Number(item.rotationDeg),
+          };
+        }
+
+        if (item.type === 'text') {
+          return {
+            type: 'text',
+            text: typeof item.text === 'string' ? item.text : '',
+            xMm: Number(item.xMm),
+            yMm: Number(item.yMm),
+            fontSizeMm: Number(item.fontSizeMm),
+            rotationDeg: item.rotationDeg === undefined ? undefined : Number(item.rotationDeg),
+            fontFamily: typeof item.fontFamily === 'string' ? item.fontFamily : undefined,
+            color: typeof item.color === 'string' ? item.color : undefined,
+            letterFontSizesMm: Array.isArray(item.letterFontSizesMm) ? item.letterFontSizesMm : undefined,
+            offsetYmm: Array.isArray(item.offsetYmm) ? item.offsetYmm : undefined,
+            letterSpacingMm: Array.isArray(item.letterSpacingMm) ? item.letterSpacingMm : undefined,
+          };
+        }
+
+        return item;
+      });
+
       return {
         layoutMode,
-        items: Array.isArray(page.items)
-          ? page.items.map((item) => {
-              if (item && item.type === 'image') {
-                return {
-                  ...item,
-                  // Expecting src like "s3://<key>". We trust frontend to send only small strings.
-                  src: typeof item.src === 'string' ? item.src : '',
-                };
-              }
-
-              if (item && item.type === 'text') {
-                return { ...item };
-              }
-
-              // Vector layout items (e.g. { kind: 'svgTemplate' | 'text' | ... })
-              // Keep them lightweight but do not mutate shape.
-              if (item && typeof item === 'object') {
-                return { ...item };
-              }
-
-              return item;
-            })
-          : [],
+        page: { widthMm, heightMm },
+        items: sanitizedItems,
       };
     });
 

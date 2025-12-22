@@ -10,6 +10,15 @@ import { BACKEND_URL } from '@/lib/backendUrl';
 
 import type { TicketOutputPage, TicketOnPage } from './TicketEditor';
 
+/**
+ * IMAGE RENDERING RULE (LOCKED):
+ * - Images are NEVER stretched by the system.
+ * - If widthMm is provided and heightMm is not, height is derived from intrinsic aspect ratio.
+ * - If heightMm is provided and widthMm is not, width is derived.
+ * - If both are provided, the system assumes admin intent and does NOT correct.
+ * - No container-based resizing is allowed.
+ */
+
 interface TicketOutputPreviewProps {
   pages: TicketOutputPage[];
   onClose: () => void;
@@ -20,9 +29,7 @@ interface TicketOutputPreviewProps {
 // Feature flag: keep vector layout code present but inactive for now.
 // When enabling vector jobs end-to-end, this can be toggled to true and
 // the assign-to-user flow can switch from raster to vector layouts.
-const USE_VECTOR_LAYOUT =
-  (import.meta as any)?.env?.VITE_ENABLE_VECTOR_LAYOUT === '1' ||
-  (import.meta as any)?.env?.VITE_ENABLE_VECTOR_LAYOUT === 'true';
+const USE_VECTOR_LAYOUT = false;
 
 // Vector layout types (not yet wired into the live flow)
 type VectorPageItem =
@@ -275,6 +282,15 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
   const printContainerRef = useRef<HTMLDivElement>(null);
   const { user, token } = useAuth();
 
+  const getPxPerMm = () => {
+    const el = printContainerRef.current;
+    if (!el) return 0;
+    const wPx = el.getBoundingClientRect().width;
+    const mm = A4_WIDTH_MM;
+    if (!wPx || !mm) return 0;
+    return wPx / mm;
+  };
+
   const [assignEmail, setAssignEmail] = useState('');
   const [assignPages, setAssignPages] = useState('500');
   const [assignLoading, setAssignLoading] = useState(false);
@@ -308,56 +324,23 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
       }
 
       if (USE_VECTOR_LAYOUT) {
-        const vectorLayoutPages = buildVectorLayoutPages(pages, { documentId });
-
-        const res = await fetch(`${BACKEND_URL}/api/admin/assign-job`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({ email: assignEmail, assignedQuota: pagesNum, layoutPages: vectorLayoutPages }),
-        });
-
-        const data = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-          const message = data.message || 'Assignment failed';
-          throw new Error(message);
-        }
-
-        toast.custom(
-          (id) => (
-            <div
-              className="rounded-lg border border-emerald-500/60 bg-background px-4 py-3 shadow-lg flex flex-col gap-1 text-sm max-w-sm"
-              onClick={() => toast.dismiss(id)}
-            >
-              <span className="text-xs font-semibold text-emerald-400 uppercase tracking-wide">
-                Assignment Started
-              </span>
-              <span className="text-foreground">
-                {pagesNum} pages assignment queued for <span className="font-medium">{assignEmail}</span>.
-              </span>
-              <span className="text-[11px] text-muted-foreground">
-                PDF background me generate ho raha hai. User login karke <span className="font-semibold">/printing</span> page par
-                apne assigned prints dekh sakta hai jab job complete ho jaye.
-              </span>
-            </div>
-          ),
-          { duration: 4000 }
-        );
-
-        return;
+        // Vector layout path is disabled
+        throw new Error('Vector layout is not supported');
       }
 
       // 1) Upload unique ticket images to backend so we only send S3 references in the job
-      const uniqueImages = new Map<string, string>(); // base64 -> s3://key
+      const uniqueImages = new Map<string, { s3Src: string; aspectRatio: number }>(); // base64 -> { s3://key, aspectRatio }
 
       for (const page of pages) {
         const src = page.ticketImageData;
         if (!src || typeof src !== 'string') continue;
         if (!src.startsWith('data:image')) continue;
         if (uniqueImages.has(src)) continue;
+
+        let aspectRatio = 0;
+        if (page.ticketImageSize?.width && page.ticketImageSize?.height) {
+          aspectRatio = page.ticketImageSize.width / page.ticketImageSize.height;
+        }
 
         try {
           const uploadRes = await fetch(`${BACKEND_URL}/api/admin/upload-ticket-image`, {
@@ -377,48 +360,76 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
           }
 
           // Store as a lightweight s3:// reference (worker knows how to resolve this)
-          uniqueImages.set(src, `s3://${uploadData.key}`);
+          uniqueImages.set(src, {
+            s3Src: `s3://${uploadData.key}`,
+            aspectRatio: Number.isFinite(aspectRatio) && aspectRatio > 0 ? aspectRatio : 1,
+          });
         } catch (err) {
           console.error('Upload ticket image error:', err);
           throw err instanceof Error ? err : new Error('Failed to upload ticket image');
         }
       }
 
-      // 2) Build lightweight layout JSON using only S3-based src values
-      // We mirror the same 3-cars-per-page layout used in this preview, including series text and all series boxes.
-      const ticketHeightPx = (A4_HEIGHT_PX - A4_FOOTER_PX) / 4;
-      const layoutPages = pages.map((page) => {
-        const s3Src = uniqueImages.get(page.ticketImageData) || '';
+      // 2) Build mm-only layout JSON (strict contract) using only S3-based src values.
+      // NOTE: This is the payload the backend trusts 1:1 for WYSIWYG output.
+      const pxPerMm = getPxPerMm();
+      if (!Number.isFinite(pxPerMm) || pxPerMm <= 0) {
+        throw new Error('Cannot measure pxPerMm (page preview not mounted)');
+      }
 
-        const fittedTicket = computeTicketFittedRectPx(page, ticketHeightPx);
+      const ptToMm = (pt: number) => (Number(pt) || 0) * (25.4 / 72);
+      const pxToMm = (px: number) => (Number(px) || 0) / pxPerMm;
+
+      const pageWidthMm = A4_WIDTH_MM;
+      const pageHeightMm = A4_HEIGHT_MM;
+      const ticketHeightMm = pageHeightMm / 4;
+      const layoutPages = pages.map((page) => {
+        const imgMeta = uniqueImages.get(page.ticketImageData);
+        const s3Src = imgMeta?.s3Src || '';
+        const aspectRatio = imgMeta?.aspectRatio || 1;
 
         const items: Array<
-          | { type: 'image'; src: string; x: number; y: number; width: number; height: number }
+          | {
+              type: 'image';
+              src: string;
+              xMm: number;
+              yMm: number;
+              widthMm: number;
+              heightMm?: number;
+              aspectRatio?: number;
+              rotationDeg?: number;
+            }
           | {
               type: 'text';
               text: string;
-              x: number;
-              y: number;
-              fontSize: number;
-              letterFontSizes?: number[];
-              letterOffsets?: number[];
-              letterSpacingAfterX?: number[];
+              xMm: number;
+              yMm: number;
+              fontSizeMm: number;
+              letterFontSizesMm?: number[];
+              offsetYmm?: number[];
+              letterSpacingMm?: number[];
               fontFamily?: string;
               color?: string;
+              rotationDeg?: number;
             }
         > = [];
 
         page.tickets.forEach((ticket, idx) => {
-          const baseY = ticketHeightPx * idx;
+          const baseYmm = ticketHeightMm * idx;
+
+          const imgXmm = (page.ticketImageXPercent / 100) * pageWidthMm;
+          const imgYmm = baseYmm + (page.ticketImageYPercent / 100) * ticketHeightMm;
+          const imgWmm = (page.ticketImageWidthPercent / 100) * pageWidthMm;
+          const imgHmm = imgWmm / aspectRatio;
 
           // Ticket image area
           items.push({
             type: 'image',
             src: s3Src,
-            x: fittedTicket.x,
-            y: baseY + fittedTicket.y,
-            width: fittedTicket.width,
-            height: fittedTicket.height,
+            xMm: imgXmm,
+            yMm: imgYmm,
+            widthMm: imgWmm,
+            aspectRatio,
           });
 
           // Series number text for each configured slot on this ticket
@@ -426,37 +437,38 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
             const seriesForSlot = ticket.seriesBySlot[slot.id];
             if (!seriesForSlot) return;
 
-            const { slotRelativeX, slotRelativeY } = computeSeriesSlotRelative(page, slot);
+            const slotXmm = imgXmm + (Number(slot.x) / 100) * imgWmm;
+            const slotYmm = imgYmm + (Number(slot.y) / 100) * imgHmm;
 
-            const mapped = mapSlotToFittedPx(
-              slotRelativeX,
-              slotRelativeY,
-              0,
-              0,
-              fittedTicket
+            // Convert legacy editor units -> mm.
+            // - fontSize: px -> mm
+            // - offsetY: px -> mm
+            // - spacingAfterX: pt -> mm
+            const fontSizeMm = pxToMm(
+              Number(seriesForSlot.letterStyles?.[0]?.fontSize) || Number(slot.defaultFontSize) || 0
             );
-
-            const slotX = mapped.x;
-            const slotY = baseY + mapped.y;
-            const fontSize =
-              seriesForSlot.letterStyles?.[0]?.fontSize || slot.defaultFontSize;
 
             items.push({
               type: 'text',
               text: seriesForSlot.seriesValue,
-              x: slotX,
-              y: slotY + fontSize,
-              fontSize,
-              letterFontSizes: seriesForSlot.letterStyles?.map((ls) => ls.fontSize),
-              letterOffsets: seriesForSlot.letterStyles?.map((ls) => ls.offsetY ?? 0),
-              letterSpacingAfterX: seriesForSlot.letterStyles?.map((ls) => ls.spacingAfterX ?? 0),
+              xMm: slotXmm,
+              yMm: slotYmm,
+              fontSizeMm,
+              letterFontSizesMm: seriesForSlot.letterStyles?.map((ls) => pxToMm(Number(ls.fontSize) || 0)),
+              offsetYmm: seriesForSlot.letterStyles?.map((ls) => pxToMm(Number(ls.offsetY) || 0)),
+              letterSpacingMm: seriesForSlot.letterStyles?.map((ls) => ptToMm(Number(ls.spacingAfterX) || 0)),
               fontFamily: slot.fontFamily,
               color: slot.color,
+              rotationDeg: Number(slot.rotation) || 0,
             });
           });
         });
 
-        return { layoutMode: 'raster' as const, items };
+        return {
+          layoutMode: 'raster' as const,
+          page: { widthMm: pageWidthMm, heightMm: pageHeightMm },
+          items,
+        };
       });
 
       // 3) Create background assignment job (no synchronous PDF generation, only S3 references)
@@ -509,8 +521,6 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
     ticket: TicketOnPage,
     ticketHeight: number
   ) => {
-    const fittedPercent = computeTicketFittedRectPercent(page);
-
     const lettersHtmlBySlot = page.seriesSlots.map((slot) => {
       const seriesForSlot = ticket.seriesBySlot[slot.id];
       const seriesText = seriesForSlot?.seriesValue ?? '';
@@ -545,7 +555,7 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
         slotRelativeY,
         slotRelativeWidth,
         slotRelativeHeight,
-        fittedPercent
+        computeTicketFittedRectPercent(page)
       );
 
       return {
@@ -563,10 +573,10 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
         <div class="ticket-inner">
           <img src="${page.ticketImageData}" class="ticket-image" style="
             position: absolute;
-            left: ${fittedPercent.x}%;
-            top: ${fittedPercent.y}%;
-            width: ${fittedPercent.width}%;
-            height: ${fittedPercent.height}%;
+            left: ${page.ticketImageXPercent}%;
+            top: ${page.ticketImageYPercent}%;
+            width: ${page.ticketImageWidthPercent}%;
+            height: auto;
           " />
           ${lettersHtmlBySlot.map(({ lettersHtml, slotRelativeX, slotRelativeY, slotRelativeWidth, slotRelativeHeight, slot }) => `
           <div class="series-slot" style="
@@ -762,132 +772,121 @@ export const TicketOutputPreview: React.FC<TicketOutputPreviewProps> = ({ pages,
           <div className="h-full overflow-auto p-6 bg-muted/30 flex justify-center items-start">
             <div
               ref={printContainerRef}
-              className="bg-white shadow-2xl relative flex flex-col rounded-none shrink-0"
+              className="bg-white shadow-2xl relative rounded-none shrink-0"
               style={{
-                width: A4_WIDTH_PX,
-                height: A4_HEIGHT_PX,
+                width: `${A4_WIDTH_MM}mm`,
+                height: `${A4_HEIGHT_MM}mm`,
               }}
             >
               {currentPageData && (
-                <div className="flex flex-col h-full">
-                  {currentPageData.tickets.map((ticket, ticketIdx) => {
-                    const ticketHeightPx = (A4_HEIGHT_PX - A4_FOOTER_PX) / 4;
+                <div className="absolute inset-0">
+                  {(() => {
+                    const pxPerMm = getPxPerMm() || 1;
+                    const ptToMm = (pt: number) => (Number(pt) || 0) * (25.4 / 72);
+                    const pxToMm = (px: number) => (Number(px) || 0) / pxPerMm;
 
-                    const fittedTicket = computeTicketFittedRectPx(currentPageData, ticketHeightPx);
+                    const pageWidthMm = A4_WIDTH_MM;
+                    const pageHeightMm = A4_HEIGHT_MM;
+                    const ticketHeightMm = pageHeightMm / 4;
+                    const aspectRatio =
+                      currentPageData.ticketImageSize?.width && currentPageData.ticketImageSize?.height
+                        ? currentPageData.ticketImageSize.width / currentPageData.ticketImageSize.height
+                        : 1;
 
-                    return (
-                      <div
-                        key={ticketIdx}
-                        className="relative overflow-hidden border-b border-dashed border-muted-foreground/30 last:border-b-0"
-                        style={{ height: ticketHeightPx }}
-                      >
-                        {/* Ticket image area with overlay */}
-                        <div className="absolute inset-0">
-                          <div className="relative w-full h-full rounded-sm bg-white overflow-hidden">
-                            <img
-                              src={currentPageData.ticketImageData}
-                              alt="Ticket"
-                              className="absolute"
-                              style={{
-                                left: fittedTicket.x,
-                                top: fittedTicket.y,
-                                width: fittedTicket.width,
-                                height: fittedTicket.height,
-                              }}
-                            />
-                            {/* Series Slots Overlay */}
-                            {[...currentPageData.seriesSlots]
-                              .sort((a, b) => (a.y - b.y) || (a.x - b.x))
-                              .map((slot) => {
-                                const {
-                                  slotRelativeX,
-                                  slotRelativeY,
-                                  slotRelativeWidth,
-                                  slotRelativeHeight,
-                                } = computeSeriesSlotRelative(currentPageData, slot);
+                    return currentPageData.tickets.map((ticket, idx) => {
+                      const baseYmm = ticketHeightMm * idx;
 
-                                const mapped = mapSlotToFittedPx(
-                                  slotRelativeX,
-                                  slotRelativeY,
-                                  slotRelativeWidth,
-                                  slotRelativeHeight,
-                                  fittedTicket
-                                );
+                      const imgXmm = (currentPageData.ticketImageXPercent / 100) * pageWidthMm;
+                      const imgYmm = baseYmm + (currentPageData.ticketImageYPercent / 100) * ticketHeightMm;
+                      const imgWmm = (currentPageData.ticketImageWidthPercent / 100) * pageWidthMm;
+                      const imgHmm = imgWmm / aspectRatio;
+
+                      return (
+                        <React.Fragment key={idx}>
+                          <img
+                            src={currentPageData.ticketImageData}
+                            alt="Ticket"
+                            style={{
+                              position: 'absolute',
+                              left: `${imgXmm}mm`,
+                              top: `${imgYmm}mm`,
+                              width: `${imgWmm}mm`,
+                              height: 'auto',
+                            }}
+                          />
+
+                          {[...currentPageData.seriesSlots]
+                            .sort((a, b) => (a.y - b.y) || (a.x - b.x))
+                            .map((slot) => {
+                              const seriesForSlot = ticket.seriesBySlot[slot.id];
+                              const seriesText = seriesForSlot?.seriesValue ?? '';
+                              if (!seriesText) return null;
+
+                              const slotXmm = imgXmm + (Number(slot.x) / 100) * imgWmm;
+                              const slotYmm = imgYmm + (Number(slot.y) / 100) * imgHmm;
+
+                              const letters = seriesText.split('').map((letter, letterIdx) => {
+                                const style = seriesForSlot?.letterStyles[letterIdx];
+                                const fontSizeMm = pxToMm(Number(style?.fontSize || slot.defaultFontSize || 0));
+                                const offsetYmm = pxToMm(Number(style?.offsetY || 0));
+                                const cumulativeSpacingMm = seriesText
+                                  .split('')
+                                  .slice(0, letterIdx)
+                                  .reduce(
+                                    (sum, _, i) =>
+                                      sum + ptToMm(Number(seriesForSlot?.letterStyles[i]?.spacingAfterX || 0)),
+                                    0
+                                  );
 
                                 return (
-                                  <div
-                                    key={slot.id}
-                                    className="absolute flex items-center overflow-visible"
+                                  <span
+                                    key={letterIdx}
                                     style={{
-                                      left: mapped.x,
-                                      top: mapped.y,
-                                      width: mapped.width,
-                                      height: mapped.height,
-                                      backgroundColor: slot.backgroundColor,
-                                      border: `${slot.borderWidth}px solid ${slot.borderColor}`,
-                                      borderRadius: slot.borderRadius,
-                                      padding: `${slot.paddingTop}px ${slot.paddingRight}px ${slot.paddingBottom}px ${slot.paddingLeft}px`,
-                                      transform: `rotate(${slot.rotation}deg)`,
-                                      transformOrigin: 'center center',
-                                      justifyContent:
-                                        slot.textAlign === 'left'
-                                          ? 'flex-start'
-                                          : slot.textAlign === 'right'
-                                          ? 'flex-end'
-                                          : 'center',
+                                      fontSize: `${fontSizeMm}mm`,
+                                      fontFamily: slot.fontFamily,
+                                      color: slot.color,
+                                      display: 'inline-block',
+                                      whiteSpace: 'pre',
+                                      transform: `translate(${cumulativeSpacingMm}mm, ${offsetYmm}mm)`,
                                     }}
                                   >
-                                    <div
-                                      className="flex items-baseline"
-                                      style={{ justifyContent: 'inherit', whiteSpace: 'pre' }}
-                                    >
-                                      {(() => {
-                                        const seriesForSlot = ticket.seriesBySlot[slot.id];
-                                        const seriesText = seriesForSlot?.seriesValue ?? '';
-                                        return seriesText.split('').map((letter, letterIdx) => {
-                                          const style = seriesForSlot?.letterStyles[letterIdx];
-                                          const fontSize = style?.fontSize || slot.defaultFontSize;
-                                          const offsetY = style?.offsetY || 0;
-                                          const cumulativeSpacingPt = seriesText
-                                            .split('')
-                                            .slice(0, letterIdx)
-                                            .reduce(
-                                              (sum, _, i) => sum + (seriesForSlot?.letterStyles[i]?.spacingAfterX || 0),
-                                              0
-                                            );
-                                          const cumulativeX = cumulativeSpacingPt * (96 / 72);
-
-                                          return (
-                                            <span
-                                              key={letterIdx}
-                                              style={{
-                                                fontSize,
-                                                fontFamily: slot.fontFamily,
-                                                color: slot.color,
-                                                display: 'inline-block',
-                                                whiteSpace: 'pre',
-                                                transform: `translate(${cumulativeX}px, ${offsetY}px)`,
-                                              }}
-                                            >
-                                              {letter === ' ' ? '\u00A0' : letter}
-                                            </span>
-                                          );
-                                        });
-                                      })()}
-                                    </div>
-                                  </div>
+                                    {letter === ' ' ? '\u00A0' : letter}
+                                  </span>
                                 );
-                              })}
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
+                              });
+
+                              const baseFontSizeMm = pxToMm(
+                                Number(seriesForSlot?.letterStyles?.[0]?.fontSize || slot.defaultFontSize || 0)
+                              );
+
+                              return (
+                                <div
+                                  key={slot.id}
+                                  style={{
+                                    position: 'absolute',
+                                    left: `${slotXmm}mm`,
+                                    top: `${slotYmm}mm`,
+                                    transform: `rotate(${slot.rotation}deg)`,
+                                    transformOrigin: 'center center',
+                                    whiteSpace: 'pre',
+                                    display: 'flex',
+                                    alignItems: 'baseline',
+                                  }}
+                                >
+                                  {letters}
+                                </div>
+                              );
+                            })}
+                        </React.Fragment>
+                      );
+                    });
+                  })()}
                 </div>
               )}
             </div>
           </div>
         </div>
+
       </div>
 
       {/* Assign panel on right for admin */}

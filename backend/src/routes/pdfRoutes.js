@@ -108,31 +108,20 @@ router.post('/generate-output-pdf', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'pages array is required' });
     }
 
-    // 1) Build PDF buffer via Puppeteer
-    //    Sometimes on Windows Puppeteer can randomly close the Chrome target
-    //    while evaluating, causing a TargetCloseError. We retry once in that case.
-    let pdfBuffer;
-    let hasRetried = false;
-    while (true) {
-      try {
-        pdfBuffer = await generateOutputPdfBuffer(pages);
-        break;
-      } catch (err) {
-        const isTargetClosed =
-          err &&
-          (err.name === 'TargetCloseError' ||
-            err.cause?.name === 'ProtocolError' ||
-            (typeof err.message === 'string' && err.message.includes('Target closed')));
-
-        if (isTargetClosed && !hasRetried) {
-          console.warn('generate-output-pdf TargetCloseError, retrying once...');
-          hasRetried = true;
-          continue;
-        }
-
-        throw err;
+    // Basic validation for mm-only layout contract
+    for (const p of pages) {
+      const w = Number(p?.page?.widthMm);
+      const h = Number(p?.page?.heightMm);
+      if (!Number.isFinite(w) || w <= 0 || !Number.isFinite(h) || h <= 0) {
+        return res.status(400).json({ message: 'Each page must include page.widthMm and page.heightMm' });
+      }
+      if (!Array.isArray(p?.items)) {
+        return res.status(400).json({ message: 'Each page must include an items array' });
       }
     }
+
+    // 1) Build PDF buffer via mm->pt (pdf-lib)
+    const pdfBuffer = await generateOutputPdfBuffer(pages);
 
     // 2) Upload to S3
     const { key, url } = await uploadToS3(pdfBuffer, 'application/pdf', 'generated/output/');
@@ -197,21 +186,22 @@ router.post('/series/generate', async (req, res) => {
     const pages = [];
     for (let n = start; n <= end; n++) {
       pages.push({
+        page: { widthMm: 210, heightMm: 297 },
         items: [
           {
             type: 'image',
             src: dataUrl,
-            x: 0,
-            y: 0,
-            width: 794,
-            height: 1123,
+            xMm: 0,
+            yMm: 0,
+            widthMm: 210,
+            heightMm: 297,
           },
           {
             type: 'text',
             text: String(n),
-            x: 80,
-            y: 80,
-            fontSize: 48,
+            xMm: 20,
+            yMm: 20,
+            fontSizeMm: 10,
           },
         ],
       });
