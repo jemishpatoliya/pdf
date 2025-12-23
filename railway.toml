@@ -5,4 +5,12 @@
   startCommand = "npm start"
 
 [deploy]
+<<<<<<< HEAD
   startCommand = "node backend/src/bootstrap.js"
+=======
+  startCommand = "node backend/src/bootstrap.js"
+
+[env]
+  AWS_REGION = "ap-south-1"
+  AWS_S3_BUCKET = "hdb-s3-bucket-20250919"
+>>>>>>> cd3b85c (1.0)
