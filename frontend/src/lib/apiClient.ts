@@ -35,6 +35,35 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   res => res,
   err => {
+    try {
+      const hasResponse = !!err?.response;
+      if (!hasResponse) {
+        const resolved = resolveBackendUrl();
+        const baseURL = String(err?.config?.baseURL || resolved || '');
+        const url = String(err?.config?.url || '');
+        const code = String(err?.code || '');
+        const method = String(err?.config?.method || '').toUpperCase();
+        const details = [
+          code ? `code=${code}` : null,
+          baseURL ? `baseURL=${baseURL}` : null,
+          url ? `url=${url}` : null,
+          method ? `method=${method}` : null,
+        ]
+          .filter(Boolean)
+          .join(' ');
+
+        const msg = details
+          ? `Network Error (${details})`
+          : 'Network Error';
+
+        if (typeof err?.message === 'string') {
+          err.message = msg;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
     if (err.response?.status === 401) {
       // logout ONCE
       window.dispatchEvent(new Event('force-logout'));
