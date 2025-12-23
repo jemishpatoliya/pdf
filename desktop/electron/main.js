@@ -122,7 +122,7 @@ function getBackendBaseUrl() {
   const trimmed = typeof raw === 'string' ? raw.trim() : '';
   if (trimmed) return trimmed;
 
-  return 'https://backend-production-1075.up.railway.app';
+  return 'https://backend-production-1262.up.railway.app';
 }
 
 // Offline cache utilities
